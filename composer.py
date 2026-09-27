@@ -61,7 +61,7 @@ MODEL = os.environ.get("LLM_MODEL", "")
 
 if _GEMINI_KEY:
     _PROVIDER = "gemini"
-    MODEL = MODEL or "gemini-2.0-flash"
+    MODEL = MODEL or "gemini-3.8-flash"
     _client = True
 elif _GROQ_KEY:
     _PROVIDER = "groq"
@@ -102,25 +102,46 @@ def _call_llm(system: str, user: str, max_tokens: int = 500) -> Optional[str]:
     return None
 
 
+# If the pinned model name gets deprecated/renamed again (Google has done
+# this repeatedly — 2.0-flash was retired in favor of 3.8-flash), fall back
+# through this list instead of dying mid-run. MODEL (env-overridable) is
+# always tried first.
+_GEMINI_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-2.5-flash"]
+
+
 def _call_gemini(system: str, user: str, max_tokens: int) -> Optional[str]:
-    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{MODEL}:generateContent?key={_GEMINI_KEY}")
-    body = json.dumps({
-        "contents": [{"parts": [{"text": user}]}],
-        "systemInstruction": {"parts": [{"text": system}]},
-        "generationConfig": {"temperature": 0, "maxOutputTokens": max_tokens},
-    }).encode("utf-8")
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Gemini HTTP {e.code}: {err_body}") from None
-    try:
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except (KeyError, IndexError):
-        raise RuntimeError(f"Gemini returned no usable candidate: {json.dumps(data)[:500]}") from None
+    tried = []
+    candidates = [MODEL] + [m for m in _GEMINI_FALLBACK_MODELS if m != MODEL]
+    last_err = None
+    for model_name in candidates:
+        tried.append(model_name)
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{model_name}:generateContent?key={_GEMINI_KEY}")
+        body = json.dumps({
+            "contents": [{"parts": [{"text": user}]}],
+            "systemInstruction": {"parts": [{"text": system}]},
+            "generationConfig": {"temperature": 0, "maxOutputTokens": max_tokens},
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            last_err = RuntimeError(f"Gemini HTTP {e.code} for model {model_name!r}: {err_body}")
+            if e.code == 404:
+                # model retired/renamed — try the next candidate
+                if os.environ.get("LLM_DEBUG"):
+                    import sys
+                    print(f"[LLM_DEBUG] {model_name!r} 404'd, trying next fallback", file=sys.stderr)
+                continue
+            raise last_err from None
+        try:
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except (KeyError, IndexError):
+            last_err = RuntimeError(f"Gemini returned no usable candidate for {model_name!r}: {json.dumps(data)[:500]}")
+            continue
+    raise last_err or RuntimeError(f"Gemini: all candidate models failed ({tried})")
 
 
 def _call_groq(system: str, user: str, max_tokens: int) -> Optional[str]:
